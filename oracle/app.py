@@ -591,16 +591,30 @@ def main():
         loop.run_until_complete(telegram_app.start())
         logger.info("Telegram Application initialized and started on background loop")
 
-        # Set the Telegram webhook
+        # Set the Telegram webhook (with self-signed cert for IP-based URL)
         webhook_url = f"{WEBHOOK_URL_BASE}/webhook"
-        loop.run_until_complete(
-            telegram_app.bot.set_webhook(
-                url=webhook_url,
-                secret_token=TELEGRAM_WEBHOOK_SECRET,
-                allowed_updates=["message", "callback_query"],
-                drop_pending_updates=True,
+        cert_path = Path("/etc/nginx/ssl/kokovoicebot.crt")
+        if cert_path.exists():
+            from telegram import InputFile
+            with open(cert_path, "rb") as cert_file:
+                loop.run_until_complete(
+                    telegram_app.bot.set_webhook(
+                        url=webhook_url,
+                        certificate=InputFile(cert_file),
+                        secret_token=TELEGRAM_WEBHOOK_SECRET,
+                        allowed_updates=["message", "callback_query"],
+                        drop_pending_updates=True,
+                    )
+                )
+        else:
+            loop.run_until_complete(
+                telegram_app.bot.set_webhook(
+                    url=webhook_url,
+                    secret_token=TELEGRAM_WEBHOOK_SECRET,
+                    allowed_updates=["message", "callback_query"],
+                    drop_pending_updates=True,
+                )
             )
-        )
         logger.info("Webhook set to %s", webhook_url)
 
         # Keep the loop running forever — all async Bot methods run here
