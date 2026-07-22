@@ -13,8 +13,19 @@ before any slow operation. This prevents the permanent-spinner bug.
 
 Security: Only ALLOWED_TELEGRAM_USER_ID may use the bot. All other users
 are rejected on every message and callback. This is single-user only.
+
+Async/sync boundary note (python-telegram-bot v21+):
+  - All Bot methods (send_message, edit_message_text, send_audio, etc.) are
+    async coroutines that MUST be awaited.
+  - Telegram handlers (start_handler, text_handler, callback_handler) are
+    async and called via the Application's async event loop — they can await
+    directly.
+  - Flask endpoints and background threads are synchronous. To call async
+    Bot methods from these contexts, we use asyncio.run() to create a
+    temporary event loop.
 """
 
+import asyncio
 import hashlib
 import hmac
 import json
@@ -86,21 +97,21 @@ def _reject_unauthorized_user(user_id: int) -> bool:
     return user_id != ALLOWED_TELEGRAM_USER_ID
 
 
-def _send_unauthorized_reply(chat_id: int):
-    """Send rejection to unauthorized users."""
-    bot.send_message(
+async def _send_unauthorized_reply(chat_id: int):
+    """Send rejection to unauthorized users (async — must be awaited)."""
+    await bot.send_message(
         chat_id=chat_id,
         text="⛔ This bot is private and reserved for its owner. You are not authorized to use it.",
     )
 
 
-def _mark_session_failed(session, error_msg: str):
-    """Mark session as failed and update Telegram UI."""
+async def _mark_session_failed(session, error_msg: str):
+    """Mark session as failed and update Telegram UI (async — must be awaited)."""
     session.state = "FAILED"
     store.update(session)
     try:
         keyboard = failed_keyboard(session.session_id)
-        bot.edit_message_text(
+        await bot.edit_message_text(
             chat_id=session.chat_id,
             message_id=session.ui_message_id,
             text=f"❌ {error_msg}\n\nPlease try again.",
@@ -110,13 +121,46 @@ def _mark_session_failed(session, error_msg: str):
         logger.warning("Failed to update UI for failed session: %s", e)
 
 
-# ── Telegram handlers (v21+ async style, but we run them synchronously via Flask) ──
+async def _deliver_audio_to_telegram(session, audio_path: Path):
+    """
+    Deliver the generated audio file to the user via Telegram.
+
+    This is an async function because bot.send_audio() and bot.edit_message_text()
+    are coroutines in python-telegram-bot v21+.
+    Called from the sync Flask upload endpoint via asyncio.run().
+    """
+    lang_display = get_language(session.language_id)["display_name"]
+    voice_display = get_voice_display_name(session.language_id, session.voice_id)
+
+    with open(audio_path, "rb") as f:
+        await bot.send_audio(
+            chat_id=session.chat_id,
+            audio=f,
+            title="Kokoro TTS",
+            performer="Kokoro",
+            caption=f"Language: {lang_display} | Voice: {voice_display}",
+        )
+
+    session.state = "COMPLETED"
+    store.update(session)
+
+    try:
+        await bot.edit_message_text(
+            chat_id=session.chat_id,
+            message_id=session.ui_message_id,
+            text=f"✅ Audio delivered!\n\nLanguage: {lang_display}\nVoice: {voice_display}\n\nSend me more text anytime.",
+        )
+    except Exception:
+        pass
+
+
+# ── Telegram handlers (v21+ async — called via Application's event loop) ──
 
 async def start_handler(update: Update, context):
     """Handle /start — show welcome message."""
     user_id = update.effective_user.id
     if _reject_unauthorized_user(user_id):
-        _send_unauthorized_reply(update.effective_chat.id)
+        await _send_unauthorized_reply(update.effective_chat.id)
         return
 
     await update.message.reply_text(
@@ -128,7 +172,7 @@ async def text_handler(update: Update, context):
     """Handle incoming text — create a session and show language selection."""
     user_id = update.effective_user.id
     if _reject_unauthorized_user(user_id):
-        _send_unauthorized_reply(update.effective_chat.id)
+        await _send_unauthorized_reply(update.effective_chat.id)
         return
 
     input_text = update.message.text
@@ -151,7 +195,7 @@ async def text_handler(update: Update, context):
 
     # Send language selection UI
     keyboard = language_keyboard(session.session_id)
-    sent = bot.send_message(
+    sent = await bot.send_message(
         chat_id=chat_id,
         text="Choose the language/accent for your voice:",
         reply_markup=keyboard,
@@ -287,7 +331,9 @@ async def callback_handler(update: Update, context):
             reply_markup=keyboard,
         )
 
-        # Dispatch GitHub Actions asynchronously
+        # Dispatch GitHub Actions asynchronously in a background thread.
+        # The background thread is synchronous, so we use asyncio.run() to
+        # call async helpers like _mark_session_failed from within it.
         def _dispatch_and_handle():
             try:
                 result = dispatch_tts_job(session)
@@ -296,7 +342,7 @@ async def callback_handler(update: Update, context):
                 logger.info("GitHub dispatch succeeded: request_id=%s", result["request_id"])
             except Exception as e:
                 logger.error("GitHub dispatch failed: %s", e)
-                _mark_session_failed(session, "Could not dispatch to GitHub Actions.")
+                asyncio.run(_mark_session_failed(session, "Could not dispatch to GitHub Actions."))
 
         thread = threading.Thread(target=_dispatch_and_handle, daemon=True)
         thread.start()
@@ -326,7 +372,7 @@ telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_ha
 telegram_app.add_handler(CallbackQueryHandler(callback_handler))
 
 
-# ── Flask endpoints ──
+# ── Flask endpoints (sync — use asyncio.run() for async Bot calls) ──
 
 @app.route("/completion", methods=["POST"])
 def completion_endpoint():
@@ -364,7 +410,7 @@ def completion_endpoint():
 
     elif status == "failure":
         error_msg = data.get("error_message", "Unknown error")
-        _mark_session_failed(session, f"Generation failed: {error_msg}")
+        asyncio.run(_mark_session_failed(session, f"Generation failed: {error_msg}"))
         return jsonify({"status": "failure_acknowledged"}), 200
 
     return jsonify({"error": "unknown status"}), 400
@@ -400,43 +446,20 @@ def upload_audio_endpoint():
 
     if audio_path.stat().st_size == 0:
         audio_path.unlink()
-        _mark_session_failed(session, "Generated audio file was empty.")
+        asyncio.run(_mark_session_failed(session, "Generated audio file was empty."))
         return jsonify({"error": "empty audio file"}), 400
 
     session.state = "DELIVERING"
     store.update(session)
 
     try:
-        lang_display = get_language(session.language_id)["display_name"]
-        voice_display = get_voice_display_name(session.language_id, session.voice_id)
-
-        with open(audio_path, "rb") as f:
-            bot.send_audio(
-                chat_id=session.chat_id,
-                audio=f,
-                title="Kokoro TTS",
-                performer="Kokoro",
-                caption=f"Language: {lang_display} | Voice: {voice_display}",
-            )
-
-        session.state = "COMPLETED"
-        store.update(session)
-
-        try:
-            bot.edit_message_text(
-                chat_id=session.chat_id,
-                message_id=session.ui_message_id,
-                text=f"✅ Audio delivered!\n\nLanguage: {lang_display}\nVoice: {voice_display}\n\nSend me more text anytime.",
-            )
-        except Exception:
-            pass
-
+        asyncio.run(_deliver_audio_to_telegram(session, audio_path))
         logger.info("Audio delivered to Telegram for session %s", session_id)
         return jsonify({"status": "delivered"}), 200
 
     except Exception as e:
         logger.error("Failed to deliver audio: %s", e)
-        _mark_session_failed(session, "Generation succeeded but delivery failed.")
+        asyncio.run(_mark_session_failed(session, "Generation succeeded but delivery failed."))
         return jsonify({"error": "delivery failed"}), 500
 
     finally:
@@ -449,9 +472,8 @@ def webhook_endpoint():
     """Receive Telegram webhook updates and process them."""
     try:
         update = Update.de_json(request.get_json(force=True), bot)
-        # Process update through the Application's update queue synchronously
-        # We need to run the async handlers in the current thread
-        import asyncio
+        # Process update through the Application's update queue synchronously.
+        # The async handlers run within this event loop.
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
         loop.run_until_complete(telegram_app.process_update(update))
@@ -473,7 +495,6 @@ def main():
     logger.info("Allowed Telegram user ID: %s", ALLOWED_TELEGRAM_USER_ID)
 
     # Initialize the Application (must be done before processing updates)
-    import asyncio
     loop = asyncio.new_event_loop()
     asyncio.set_event_loop(loop)
     loop.run_until_complete(telegram_app.initialize())
