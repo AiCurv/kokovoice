@@ -2,14 +2,19 @@
 Lightweight session store for TTS sessions.
 
 Sessions track the stateful flow: text received → language → voice →
-confirmation → generating → delivery. State is persisted to a JSON file
-on disk so it survives process restarts.
+confirmation → generating → upload_pending → delivery → completed.
+State is persisted to a JSON file on disk so it survives process restarts.
 
 Security: Only ALLOWED_TELEGRAM_USER_ID may create or interact with sessions.
 Session ownership is validated on every callback.
+
+Thread safety: A threading.Lock protects all reads/writes since Flask
+runs with threaded=True by default and background threads from dispatch
+also mutate sessions.
 """
 
 import json
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -69,26 +74,29 @@ class Session:
 
 
 class SessionStore:
-    """Persistent JSON-based session store."""
+    """Persistent JSON-based session store with thread safety."""
 
     def __init__(self):
         self._sessions: dict[str, Session] = {}
+        self._lock = threading.Lock()
         self._load()
 
     def _load(self):
-        if _STORE_PATH.exists():
-            with open(_STORE_PATH) as f:
-                data = json.load(f)
-            for sid, sdata in data.items():
-                self._sessions[sid] = Session(sdata)
-            # Purge expired sessions on load
-            self._purge_expired()
+        with self._lock:
+            if _STORE_PATH.exists():
+                with open(_STORE_PATH) as f:
+                    data = json.load(f)
+                for sid, sdata in data.items():
+                    self._sessions[sid] = Session(sdata)
+                self._purge_expired()
 
     def _save(self):
+        """Save to disk — MUST be called while holding self._lock."""
         with open(_STORE_PATH, "w") as f:
             json.dump({sid: s.to_dict() for sid, s in self._sessions.items()}, f, indent=2)
 
     def _purge_expired(self):
+        """Purge expired sessions — MUST be called while holding self._lock."""
         expired = [sid for sid, s in self._sessions.items() if s.is_expired()]
         for sid in expired:
             del self._sessions[sid]
@@ -121,40 +129,45 @@ class SessionStore:
             "created_at": now,
             "updated_at": now,
         })
-        self._sessions[session_id] = session
-        self._save()
+        with self._lock:
+            self._sessions[session_id] = session
+            self._save()
         return session
 
     def get(self, session_id: str) -> Optional[Session]:
         """Retrieve a session by ID. Returns None if expired or missing."""
-        session = self._sessions.get(session_id)
-        if session is None:
-            return None
-        if session.is_expired():
-            del self._sessions[session_id]
-            self._save()
-            return None
-        return session
+        with self._lock:
+            session = self._sessions.get(session_id)
+            if session is None:
+                return None
+            if session.is_expired():
+                del self._sessions[session_id]
+                self._save()
+                return None
+            return session
 
     def get_by_user(self, telegram_user_id: int) -> Optional[Session]:
         """Get the most recent active session for a user."""
-        self._purge_expired()
-        user_sessions = [
-            s for s in self._sessions.values()
-            if s.telegram_user_id == telegram_user_id and not s.is_expired()
-        ]
-        if not user_sessions:
-            return None
-        return max(user_sessions, key=lambda s: s.updated_at)
+        with self._lock:
+            self._purge_expired()
+            user_sessions = [
+                s for s in self._sessions.values()
+                if s.telegram_user_id == telegram_user_id and not s.is_expired()
+            ]
+            if not user_sessions:
+                return None
+            return max(user_sessions, key=lambda s: s.updated_at)
 
     def update(self, session: Session):
         """Update a session and persist."""
         session.updated_at = time.time()
-        self._sessions[session.session_id] = session
-        self._save()
+        with self._lock:
+            self._sessions[session.session_id] = session
+            self._save()
 
     def delete(self, session_id: str):
         """Delete a session."""
-        if session_id in self._sessions:
-            del self._sessions[session_id]
-            self._save()
+        with self._lock:
+            if session_id in self._sessions:
+                del self._sessions[session_id]
+                self._save()

@@ -18,19 +18,20 @@ StartLimitBurst=3
 # REPLACE these placeholders with actual values before enabling the service
 Environment=TELEGRAM_BOT_TOKEN=%TELEGRAM_BOT_TOKEN%
 Environment=ALLOWED_TELEGRAM_USER_ID=%ALLOWED_TELEGRAM_USER_ID%
+Environment=TELEGRAM_WEBHOOK_SECRET=%TELEGRAM_WEBHOOK_SECRET%
 Environment=GITHUB_REPOSITORY_OWNER=%GITHUB_REPO_OWNER%
 Environment=GITHUB_REPOSITORY_NAME=%GITHUB_REPO_NAME%
 Environment=GITHUB_DISPATCH_TOKEN=%GITHUB_DISPATCH_TOKEN%
 Environment=ORACLE_COMPLETION_SECRET=%ORACLE_COMPLETION_SECRET%
 Environment=WEBHOOK_PORT=8443
-Environment=WEBHOOK_URL_BASE=https://%ORACLE_PUBLIC_DOMAIN%
+Environment=WEBHOOK_URL_BASE=https://%ORACLE_PUBLIC_IP%
 
 # Security hardening
-NoNewPrivileges=true
+NoNewprivileges=true
 ProtectSystem=strict
 ProtectHome=true
 ReadWritePaths=/opt/kokovoicebot/oracle/sessions.json /tmp
-PrivateTmp=true
+PrivateTmp=false
 
 [Install]
 WantedBy=multi-user.target

@@ -4,25 +4,30 @@ Kokovoicebot — Oracle Control Plane Server.
 Persistent Telegram webhook server that handles the TTS flow using
 python-telegram-bot v21+ Application-based API with Flask webhook receiver.
 
+ARCHITECTURE (corrected):
+  Flask receives the webhook POST → puts the Update into the Application's
+  update_queue → the Application's own persistent event loop processes it
+  via its registered async handlers. This is the ONLY safe way to bridge
+  Flask (sync) with python-telegram-bot v21+ (async Application).
+
+  We NEVER create temporary event loops or call asyncio.run() for Bot
+  methods from Flask endpoints. Instead, we use the Application's
+  update_queue.put() to schedule work on the Application's loop, and
+  asyncio.run_coroutine_threadsafe() for async work from sync threads.
+
 Result-transfer architecture (two-step binary upload):
-  Step 1: Small JSON callback to /completion (< 65 KB, fits in GitHub Actions client_payload)
-  Step 2: Binary multipart upload to /upload/audio with HMAC token authentication
+  Step 1: Small JSON callback to /completion (< 65 KB)
+  Step 2: Binary multipart upload to /upload/audio with HMAC one-time-use token
 
 CRITICAL RULE: answer_callback_query is called IMMEDIATELY on every callback
 before any slow operation. This prevents the permanent-spinner bug.
 
-Security: Only ALLOWED_TELEGRAM_USER_ID may use the bot. All other users
-are rejected on every message and callback. This is single-user only.
-
-Async/sync boundary note (python-telegram-bot v21+):
-  - All Bot methods (send_message, edit_message_text, send_audio, etc.) are
-    async coroutines that MUST be awaited.
-  - Telegram handlers (start_handler, text_handler, callback_handler) are
-    async and called via the Application's async event loop — they can await
-    directly.
-  - Flask endpoints and background threads are synchronous. To call async
-    Bot methods from these contexts, we use asyncio.run() to create a
-    temporary event loop.
+Security:
+  - Only ALLOWED_TELEGRAM_USER_ID may use the bot (single-user lock)
+  - Telegram webhook secret_token validated on every /webhook POST
+  - HMAC upload tokens are one-time-use (consumed after first valid upload)
+  - Completion endpoint authenticated via X-Completion-Secret header
+  - Duplicate completion callbacks rejected by state machine
 """
 
 import asyncio
@@ -36,7 +41,7 @@ from pathlib import Path
 
 from flask import Flask, request, jsonify
 
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, CallbackQueryHandler, filters
 
 from oracle.config import (
@@ -45,6 +50,8 @@ from oracle.config import (
     WEBHOOK_PORT,
     WEBHOOK_URL_BASE,
     ORACLE_COMPLETION_SECRET,
+    TELEGRAM_WEBHOOK_SECRET,
+    MAX_INPUT_TEXT_LENGTH,
 )
 from oracle.session_store import SessionStore
 from oracle.telegram_ui import (
@@ -64,19 +71,27 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Initialize Flask and components
+# Initialize Flask
 app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB for audio uploads
 
-store = SessionStore()
-bot = Bot(token=TELEGRAM_BOT_TOKEN)
-
-# Create the telegram-bot Application (v21+ API)
+# ── Create the telegram-bot Application (v21+ API) ──
+# This Application has its OWN persistent event loop that runs in a
+# background thread. All async Bot methods run on this loop.
 telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+store = SessionStore()
 
+# Track consumed upload tokens for one-time-use enforcement
+_consumed_tokens: set[str] = set()
+
+# The Application's event loop reference — set during startup
+_app_loop: asyncio.AbstractEventLoop = None
+
+
+# ── HMAC Token Generation and Validation ──
 
 def _generate_upload_token(session_id: str, request_id: str) -> str:
-    """HMAC-based one-time upload token for authenticating audio uploads."""
+    """HMAC-based upload token for authenticating audio uploads."""
     message = f"{session_id}:{request_id}"
     token = hmac.new(
         ORACLE_COMPLETION_SECRET.encode("utf-8"),
@@ -87,9 +102,23 @@ def _generate_upload_token(session_id: str, request_id: str) -> str:
 
 
 def _validate_upload_token(session_id: str, request_id: str, token: str) -> bool:
-    """Validate that the upload token matches the expected HMAC."""
+    """
+    Validate upload token: HMAC must match AND token must not have been
+    consumed already (one-time-use enforcement).
+    """
     expected = _generate_upload_token(session_id, request_id)
-    return hmac.compare_digest(expected, token)
+    if not hmac.compare_digest(expected, token):
+        return False
+    # One-time-use: reject if already consumed
+    if token in _consumed_tokens:
+        logger.warning("Rejected replayed upload token for session %s", session_id)
+        return False
+    return True
+
+
+def _consume_upload_token(token: str):
+    """Mark an upload token as consumed (one-time-use)."""
+    _consumed_tokens.add(token)
 
 
 def _reject_unauthorized_user(user_id: int) -> bool:
@@ -97,20 +126,24 @@ def _reject_unauthorized_user(user_id: int) -> bool:
     return user_id != ALLOWED_TELEGRAM_USER_ID
 
 
+# ── Async helpers (run on Application's event loop) ──
+
 async def _send_unauthorized_reply(chat_id: int):
-    """Send rejection to unauthorized users (async — must be awaited)."""
+    """Send rejection to unauthorized users."""
+    bot = telegram_app.bot
     await bot.send_message(
         chat_id=chat_id,
-        text="⛔ This bot is private and reserved for its owner. You are not authorized to use it.",
+        text="⛔ This bot is private and reserved for its owner.",
     )
 
 
 async def _mark_session_failed(session, error_msg: str):
-    """Mark session as failed and update Telegram UI (async — must be awaited)."""
+    """Mark session as failed and update Telegram UI."""
     session.state = "FAILED"
     store.update(session)
     try:
         keyboard = failed_keyboard(session.session_id)
+        bot = telegram_app.bot
         await bot.edit_message_text(
             chat_id=session.chat_id,
             message_id=session.ui_message_id,
@@ -122,13 +155,8 @@ async def _mark_session_failed(session, error_msg: str):
 
 
 async def _deliver_audio_to_telegram(session, audio_path: Path):
-    """
-    Deliver the generated audio file to the user via Telegram.
-
-    This is an async function because bot.send_audio() and bot.edit_message_text()
-    are coroutines in python-telegram-bot v21+.
-    Called from the sync Flask upload endpoint via asyncio.run().
-    """
+    """Deliver the generated audio file to the user via Telegram."""
+    bot = telegram_app.bot
     lang_display = get_language(session.language_id)["display_name"]
     voice_display = get_voice_display_name(session.language_id, session.voice_id)
 
@@ -152,6 +180,21 @@ async def _deliver_audio_to_telegram(session, audio_path: Path):
         )
     except Exception:
         pass
+
+
+# ── Schedule async work on Application's loop ──
+
+def _schedule_async(coro):
+    """
+    Schedule an async coroutine to run on the Application's event loop.
+    
+    Uses asyncio.run_coroutine_threadsafe() which is the correct way to
+    submit work to a running event loop from a different (sync) thread.
+    """
+    if _app_loop is None or _app_loop.is_closed():
+        logger.error("Application event loop is not available — cannot schedule async work")
+        return
+    asyncio.run_coroutine_threadsafe(coro, _app_loop)
 
 
 # ── Telegram handlers (v21+ async — called via Application's event loop) ──
@@ -180,6 +223,13 @@ async def text_handler(update: Update, context):
         await update.message.reply_text("Please send some text to convert to speech.")
         return
 
+    if len(input_text) > MAX_INPUT_TEXT_LENGTH:
+        await update.message.reply_text(
+            f"⚠️ Text too long ({len(input_text)} chars). Maximum is {MAX_INPUT_TEXT_LENGTH} characters. "
+            f"Please send a shorter message."
+        )
+        return
+
     chat_id = update.effective_chat.id
     message_id = update.message.message_id
 
@@ -194,6 +244,7 @@ async def text_handler(update: Update, context):
     store.update(session)
 
     # Send language selection UI
+    bot = context.bot
     keyboard = language_keyboard(session.session_id)
     sent = await bot.send_message(
         chat_id=chat_id,
@@ -207,13 +258,14 @@ async def text_handler(update: Update, context):
 async def callback_handler(update: Update, context):
     """
     Handle all inline keyboard callbacks.
-
+    
     CRITICAL: answer_callback_query is called IMMEDIATELY before any slow work.
     """
     query = update.callback_query
     user_id = query.from_user.id
 
     # ── IMMEDIATE callback acknowledgement ──
+    # This MUST happen before ANY other work to prevent the spinner bug.
     await query.answer()
 
     if _reject_unauthorized_user(user_id):
@@ -331,9 +383,10 @@ async def callback_handler(update: Update, context):
             reply_markup=keyboard,
         )
 
-        # Dispatch GitHub Actions asynchronously in a background thread.
-        # The background thread is synchronous, so we use asyncio.run() to
-        # call async helpers like _mark_session_failed from within it.
+        # Dispatch GitHub Actions in a background thread.
+        # The thread is sync; when it needs to call async Bot methods
+        # (e.g., _mark_session_failed), it uses _schedule_async() to
+        # submit the coroutine to the Application's running event loop.
         def _dispatch_and_handle():
             try:
                 result = dispatch_tts_job(session)
@@ -342,7 +395,7 @@ async def callback_handler(update: Update, context):
                 logger.info("GitHub dispatch succeeded: request_id=%s", result["request_id"])
             except Exception as e:
                 logger.error("GitHub dispatch failed: %s", e)
-                asyncio.run(_mark_session_failed(session, "Could not dispatch to GitHub Actions."))
+                _schedule_async(_mark_session_failed(session, "Could not dispatch to GitHub Actions."))
 
         thread = threading.Thread(target=_dispatch_and_handle, daemon=True)
         thread.start()
@@ -372,7 +425,33 @@ telegram_app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_ha
 telegram_app.add_handler(CallbackQueryHandler(callback_handler))
 
 
-# ── Flask endpoints (sync — use asyncio.run() for async Bot calls) ──
+# ── Flask endpoints (sync — bridge to Application via update_queue or _schedule_async) ──
+
+@app.route("/webhook", methods=["POST"])
+def webhook_endpoint():
+    """Receive Telegram webhook updates and process them via Application's queue."""
+    # Validate Telegram webhook secret token
+    secret_header = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
+    if secret_header != TELEGRAM_WEBHOOK_SECRET:
+        logger.warning("Webhook: invalid secret_token header")
+        return jsonify({"status": "rejected"}), 403
+
+    try:
+        update = Update.de_json(request.get_json(force=True), telegram_app.bot)
+        if update is None:
+            return jsonify({"status": "invalid_update"}), 400
+
+        # Put the update into the Application's update_queue.
+        # The Application's own event loop will process it via the
+        # registered handlers. This is the CORRECT bridge pattern for
+        # python-telegram-bot v21+ with external webhook servers.
+        telegram_app.update_queue.put_nowait(update)
+        return jsonify({"status": "ok"}), 200
+
+    except Exception as e:
+        logger.error("Webhook processing error: %s", e)
+        return jsonify({"status": "error", "message": str(e)[:200]}), 200
+
 
 @app.route("/completion", methods=["POST"])
 def completion_endpoint():
@@ -394,12 +473,22 @@ def completion_endpoint():
     if session is None:
         return jsonify({"error": "session not found or expired"}), 404
 
-    if session.state in ("COMPLETED", "DELIVERING"):
+    # Reject if session has already moved past GENERATING state
+    # (prevents duplicate completion callbacks)
+    if session.state in ("COMPLETED", "DELIVERING", "UPLOAD_PENDING"):
+        logger.info("Duplicate completion for session %s in state %s — ignoring", session_id, session.state)
         return jsonify({"status": "already_completed"}), 200
+
+    # Session must be in GENERATING state to accept completion
+    if session.state != "GENERATING":
+        logger.warning("Completion for session %s in unexpected state %s", session_id, session.state)
+        return jsonify({"error": "unexpected_session_state"}), 400
 
     if status == "success":
         upload_token = _generate_upload_token(session_id, request_id)
         session.request_id = request_id
+        # Transition to UPLOAD_PENDING — prevents duplicate completions
+        session.state = "UPLOAD_PENDING"
         store.update(session)
         logger.info("Completion callback: success, upload_token for session %s", session_id)
         return jsonify({
@@ -410,7 +499,7 @@ def completion_endpoint():
 
     elif status == "failure":
         error_msg = data.get("error_message", "Unknown error")
-        asyncio.run(_mark_session_failed(session, f"Generation failed: {error_msg}"))
+        _schedule_async(_mark_session_failed(session, f"Generation failed: {error_msg}"))
         return jsonify({"status": "failure_acknowledged"}), 200
 
     return jsonify({"error": "unknown status"}), 400
@@ -427,14 +516,18 @@ def upload_audio_endpoint():
         return jsonify({"error": "missing session_id, request_id, or upload_token"}), 400
 
     if not _validate_upload_token(session_id, request_id, upload_token):
-        logger.warning("Upload endpoint: invalid upload_token")
-        return jsonify({"error": "invalid upload_token"}), 403
+        logger.warning("Upload endpoint: invalid or replayed upload_token")
+        return jsonify({"error": "invalid or replayed upload_token"}), 403
+
+    # Mark token as consumed IMMEDIATELY (one-time-use)
+    _consume_upload_token(upload_token)
 
     session = store.get(session_id)
     if session is None:
         return jsonify({"error": "session not found or expired"}), 404
 
-    if session.state in ("COMPLETED", "DELIVERING"):
+    if session.state not in ("UPLOAD_PENDING", "GENERATING"):
+        logger.info("Upload for session %s in state %s — already handled", session_id, session.state)
         return jsonify({"status": "already_completed"}), 200
 
     audio_file = request.files.get("audio_file")
@@ -446,42 +539,31 @@ def upload_audio_endpoint():
 
     if audio_path.stat().st_size == 0:
         audio_path.unlink()
-        asyncio.run(_mark_session_failed(session, "Generated audio file was empty."))
+        _schedule_async(_mark_session_failed(session, "Generated audio file was empty."))
         return jsonify({"error": "empty audio file"}), 400
 
     session.state = "DELIVERING"
     store.update(session)
 
     try:
-        asyncio.run(_deliver_audio_to_telegram(session, audio_path))
+        # Schedule audio delivery on the Application's event loop and wait for result
+        future = asyncio.run_coroutine_threadsafe(
+            _deliver_audio_to_telegram(session, audio_path),
+            _app_loop,
+        )
+        # Wait for delivery to complete (with timeout)
+        future.result(timeout=60)
         logger.info("Audio delivered to Telegram for session %s", session_id)
         return jsonify({"status": "delivered"}), 200
 
     except Exception as e:
         logger.error("Failed to deliver audio: %s", e)
-        asyncio.run(_mark_session_failed(session, "Generation succeeded but delivery failed."))
+        _schedule_async(_mark_session_failed(session, "Generation succeeded but delivery failed."))
         return jsonify({"error": "delivery failed"}), 500
 
     finally:
         if audio_path.exists():
             audio_path.unlink()
-
-
-@app.route("/webhook", methods=["POST"])
-def webhook_endpoint():
-    """Receive Telegram webhook updates and process them."""
-    try:
-        update = Update.de_json(request.get_json(force=True), bot)
-        # Process update through the Application's update queue synchronously.
-        # The async handlers run within this event loop.
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(telegram_app.process_update(update))
-        loop.close()
-        return jsonify({"status": "ok"}), 200
-    except Exception as e:
-        logger.error("Webhook processing error: %s", e)
-        return jsonify({"status": "error", "message": str(e)[:200]}), 200
 
 
 @app.route("/health", methods=["GET"])
@@ -494,14 +576,47 @@ def main():
     logger.info("Starting Kokovoicebot Oracle Control Plane...")
     logger.info("Allowed Telegram user ID: %s", ALLOWED_TELEGRAM_USER_ID)
 
-    # Initialize the Application (must be done before processing updates)
-    loop = asyncio.new_event_loop()
-    asyncio.set_event_loop(loop)
-    loop.run_until_complete(telegram_app.initialize())
-    loop.close()
-    logger.info("Telegram Application initialized")
+    # ── Start Application's event loop in a background thread ──
+    # The Application needs a persistent running event loop for all async work.
+    # We initialize and start it in a dedicated thread, then capture the loop
+    # reference for use by _schedule_async() and run_coroutine_threadsafe().
+    def _run_app():
+        global _app_loop
+        loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(loop)
+        _app_loop = loop
 
-    # Start Flask server
+        # Initialize and start the Application on this loop
+        loop.run_until_complete(telegram_app.initialize())
+        loop.run_until_complete(telegram_app.start())
+        logger.info("Telegram Application initialized and started on background loop")
+
+        # Set the Telegram webhook
+        webhook_url = f"{WEBHOOK_URL_BASE}/webhook"
+        loop.run_until_complete(
+            telegram_app.bot.set_webhook(
+                url=webhook_url,
+                secret_token=TELEGRAM_WEBHOOK_SECRET,
+                allowed_updates=["message", "callback_query"],
+                drop_pending_updates=True,
+            )
+        )
+        logger.info("Webhook set to %s", webhook_url)
+
+        # Keep the loop running forever — all async Bot methods run here
+        loop.run_forever()
+
+    app_thread = threading.Thread(target=_run_app, daemon=True)
+    app_thread.start()
+
+    # Wait for Application to be ready
+    time.sleep(3)
+
+    if _app_loop is None:
+        logger.error("Application event loop failed to start — aborting")
+        return
+
+    # Start Flask server (sync — receives webhooks, puts updates into queue)
     app.run(
         host="0.0.0.0",
         port=WEBHOOK_PORT,

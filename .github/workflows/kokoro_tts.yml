@@ -4,6 +4,9 @@ on:
   repository_dispatch:
     types: [kokoro_tts_request]
 
+permissions:
+  contents: read
+
 jobs:
   kokoro-tts:
     runs-on: ubuntu-latest
