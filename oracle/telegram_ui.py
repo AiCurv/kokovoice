@@ -11,8 +11,7 @@ answerCallbackQuery BEFORE any slow work (GitHub dispatch, etc.).
 
 import logging
 
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
-from telegram.ext import CallbackContext
+from telegram import InlineKeyboardButton, InlineKeyboardMarkup
 
 from oracle.config import VOICE_PAGE_SIZE
 from oracle.voice_registry import (
