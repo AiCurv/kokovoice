@@ -77,7 +77,7 @@ class SessionStore:
     """Persistent JSON-based session store with thread safety."""
 
     def __init__(self):
-        self._sessions: dict[str, Session] = {}
+        self._sessions = {}  # type: dict
         self._lock = threading.Lock()
         self._load()
 
@@ -85,7 +85,12 @@ class SessionStore:
         with self._lock:
             if _STORE_PATH.exists():
                 with open(_STORE_PATH) as f:
-                    data = json.load(f)
+                    content = f.read().strip()
+                    if not content:
+                        # Empty file — initialize with empty dict
+                        data = {}
+                    else:
+                        data = json.loads(content)
                 for sid, sdata in data.items():
                     self._sessions[sid] = Session(sdata)
                 self._purge_expired()

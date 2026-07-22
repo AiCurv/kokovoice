@@ -82,10 +82,10 @@ telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 store = SessionStore()
 
 # Track consumed upload tokens for one-time-use enforcement
-_consumed_tokens: set[str] = set()
+_consumed_tokens = set()  # type: set
 
 # The Application's event loop reference — set during startup
-_app_loop: asyncio.AbstractEventLoop = None
+_app_loop = None  # type: asyncio.AbstractEventLoop
 
 
 # ── HMAC Token Generation and Validation ──
