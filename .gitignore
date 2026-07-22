@@ -1,0 +1,40 @@
+# Secrets — NEVER commit these
+.env
+.env.local
+.env.production
+*.pem
+*.key
+secrets/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.venv/
+venv/
+
+# Audio artifacts (temporary)
+*.wav
+*.mp3
+*.ogg
+
+# IDE
+.vscode/
+.idea/
+*.swp
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
+
+# Model weights — NEVER commit
+*.pt
+*.bin
+*.onnx
+kokoro_model_cache/

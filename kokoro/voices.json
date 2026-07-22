@@ -1,0 +1,46 @@
+{
+  "model_id": "hexgrad/Kokoro-82M",
+  "model_revision": "f3ff3571791e39611d31c381e3a41a3af07b4987",
+  "supported_languages": {
+    "american_english": {
+      "lang_code": "a",
+      "display_name": "🇺🇸 American English",
+      "voices": {
+        "af_heart":   { "name": "Heart",   "gender": "female", "grade": "A",   "traits": ["❤️"] },
+        "af_bella":   { "name": "Bella",   "gender": "female", "grade": "A-",  "traits": ["🔥"] },
+        "af_nicole":  { "name": "Nicole",  "gender": "female", "grade": "B-",  "traits": ["🎧"] },
+        "af_sarah":   { "name": "Sarah",   "gender": "female", "grade": "C+",  "traits": [] },
+        "af_alloy":   { "name": "Alloy",   "gender": "female", "grade": "C",   "traits": [] },
+        "af_aoede":   { "name": "Aoede",   "gender": "female", "grade": "C+",  "traits": [] },
+        "af_kore":    { "name": "Kore",    "gender": "female", "grade": "C+",  "traits": [] },
+        "af_nova":    { "name": "Nova",    "gender": "female", "grade": "C",   "traits": [] },
+        "af_river":   { "name": "River",   "gender": "female", "grade": "D",   "traits": [] },
+        "af_jessica": { "name": "Jessica", "gender": "female", "grade": "D",   "traits": [] },
+        "af_sky":     { "name": "Sky",     "gender": "female", "grade": "C-",  "traits": [] },
+        "am_adam":    { "name": "Adam",    "gender": "male",   "grade": "F+",  "traits": [] },
+        "am_michael": { "name": "Michael", "gender": "male",   "grade": "C+",  "traits": [] },
+        "am_puck":    { "name": "Puck",    "gender": "male",   "grade": "C+",  "traits": [] },
+        "am_fenrir":  { "name": "Fenrir",  "gender": "male",   "grade": "C+",  "traits": [] },
+        "am_echo":    { "name": "Echo",    "gender": "male",   "grade": "D",   "traits": [] },
+        "am_eric":    { "name": "Eric",    "gender": "male",   "grade": "D",   "traits": [] },
+        "am_liam":    { "name": "Liam",    "gender": "male",   "grade": "D",   "traits": [] },
+        "am_onyx":    { "name": "Onyx",    "gender": "male",   "grade": "D",   "traits": [] },
+        "am_santa":   { "name": "Santa",   "gender": "male",   "grade": "D-",  "traits": [] }
+      }
+    },
+    "british_english": {
+      "lang_code": "b",
+      "display_name": "🇬🇧 British English",
+      "voices": {
+        "bf_emma":     { "name": "Emma",     "gender": "female", "grade": "B-",  "traits": [] },
+        "bf_alice":    { "name": "Alice",    "gender": "female", "grade": "D",   "traits": [] },
+        "bf_isabella": { "name": "Isabella", "gender": "female", "grade": "C",   "traits": [] },
+        "bf_lily":     { "name": "Lily",     "gender": "female", "grade": "D",   "traits": [] },
+        "bm_daniel":   { "name": "Daniel",   "gender": "male",   "grade": "D",   "traits": [] },
+        "bm_fable":    { "name": "Fable",    "gender": "male",   "grade": "C",   "traits": [] },
+        "bm_george":   { "name": "George",   "gender": "male",   "grade": "C",   "traits": [] },
+        "bm_lewis":    { "name": "Lewis",    "gender": "male",   "grade": "D+",  "traits": [] }
+      }
+    }
+  }
+}

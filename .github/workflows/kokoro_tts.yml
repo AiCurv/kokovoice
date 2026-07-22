@@ -1,0 +1,61 @@
+name: Kokoro TTS Inference
+
+on:
+  repository_dispatch:
+    types: [kokoro_tts_request]
+
+jobs:
+  kokoro-tts:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install system dependency (espeak-ng)
+        run: sudo apt-get update && sudo apt-get install -y espeak-ng
+
+      - name: Install Kokoro inference package
+        run: pip install kokoro>=0.9.4 soundfile requests
+
+      - name: Restore model cache
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/huggingface
+          key: kokoro-model-v1-${{ hashFiles('kokoro/voices.json') }}
+          restore-keys: |
+            kokoro-model-v1-
+
+      - name: Validate dispatch payload
+        env:
+          DISPATCH_LANG: ${{ github.event.client_payload.language_id }}
+          DISPATCH_VOICE: ${{ github.event.client_payload.voice_id }}
+          DISPATCH_KOKORO_LANG: ${{ github.event.client_payload.kokoro_lang_code }}
+          DISPATCH_SPEED: ${{ github.event.client_payload.speed }}
+        run: |
+          python3 scripts/validate_payload.py
+
+      - name: Run Kokoro TTS inference and deliver audio
+        env:
+          DISPATCH_TEXT: ${{ github.event.client_payload.input_text }}
+          DISPATCH_LANG_CODE: ${{ github.event.client_payload.kokoro_lang_code }}
+          DISPATCH_VOICE: ${{ github.event.client_payload.voice_id }}
+          DISPATCH_SPEED: ${{ github.event.client_payload.speed }}
+          DISPATCH_SESSION_ID: ${{ github.event.client_payload.session_id }}
+          DISPATCH_REQUEST_ID: ${{ github.event.client_payload.request_id }}
+          DISPATCH_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          ORACLE_COMPLETION_URL: ${{ secrets.ORACLE_COMPLETION_URL }}
+          ORACLE_COMPLETION_SECRET: ${{ secrets.ORACLE_COMPLETION_SECRET }}
+        run: |
+          python3 scripts/run_kokoro.py
+
+      - name: Clean up temporary files
+        if: always()
+        run: |
+          rm -f /tmp/kokoro_output.wav
