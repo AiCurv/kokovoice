@@ -35,6 +35,20 @@ jobs:
           restore-keys: |
             kokoro-model-v1-
 
+      - name: Parse text data and set environment
+        run: |
+          python3 -c "
+          import json, os
+          text_data = json.loads(os.environ['TEXT_DATA_RAW'])
+          with open(os.environ['GITHUB_ENV'], 'a') as f:
+              f.write(f'DISPATCH_TEXT={text_data[\"input_text\"]}\n')
+              f.write(f'DISPATCH_CHUNKS_JSON={json.dumps(text_data[\"chunks\"])}\n')
+              f.write(f'DISPATCH_TOTAL_CHUNKS={text_data[\"total_chunks\"]}\n')
+          "
+        env:
+          TEXT_DATA_RAW: ${{ github.event.client_payload.text_data }}
+          GITHUB_ENV: ${{ github.env }}
+
       - name: Validate dispatch payload
         env:
           DISPATCH_LANG: ${{ github.event.client_payload.language_id }}
@@ -46,15 +60,11 @@ jobs:
 
       - name: Run Kokoro TTS inference and deliver audio (chunked)
         env:
-          DISPATCH_TEXT: ${{ github.event.client_payload.input_text }}
+          DISPATCH_SESSION_ID: ${{ github.event.client_payload.session_id }}
+          DISPATCH_REQUEST_ID: ${{ github.event.client_payload.request_id }}
           DISPATCH_LANG_CODE: ${{ github.event.client_payload.kokoro_lang_code }}
           DISPATCH_VOICE: ${{ github.event.client_payload.voice_id }}
           DISPATCH_SPEED: ${{ github.event.client_payload.speed }}
-          DISPATCH_SESSION_ID: ${{ github.event.client_payload.session_id }}
-          DISPATCH_REQUEST_ID: ${{ github.event.client_payload.request_id }}
-          DISPATCH_CHAT_ID: ${{ github.event.client_payload.chat_id }}
-          DISPATCH_CHUNKS_JSON: ${{ github.event.client_payload.chunks }}
-          DISPATCH_TOTAL_CHUNKS: ${{ github.event.client_payload.total_chunks }}
           ORACLE_COMPLETION_URL: ${{ secrets.ORACLE_COMPLETION_URL }}
           ORACLE_COMPLETION_SECRET: ${{ secrets.ORACLE_COMPLETION_SECRET }}
         run: |

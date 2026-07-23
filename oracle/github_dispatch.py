@@ -4,9 +4,20 @@ GitHub Actions Dispatch — trigger Kokoro TTS workflows via repository_dispatch
 This module sends a repository_dispatch event to GitHub Actions with
 the TTS session details, including text chunks for long input.
 
-It is called AFTER the Telegram callback is acknowledged and AFTER the
-session transitions to DISPATCHING state, so it never blocks the Telegram
-response.
+CRITICAL: GitHub repository_dispatch client_payload is limited to 10 properties.
+We combine text-related fields (input_text, chunks, total_chunks) into a single
+`text_data` JSON-encoded string to stay within the limit.
+
+Payload structure (9 properties — within the 10-property limit):
+  - session_id: unique session identifier
+  - text_data: JSON string containing {input_text, chunks, total_chunks}
+  - language_id: language identifier (e.g., "us_en")
+  - kokoro_lang_code: Kokoro pipeline lang code (e.g., "a")
+  - voice_id: voice identifier (e.g., "af_heart")
+  - speed: speech speed factor (e.g., "1.0")
+  - request_id: unique request identifier
+  - telegram_user_id: Telegram user ID (for reference)
+  - chat_id: Telegram chat ID (for reference)
 
 Dispatch failure → session transitions to FAILED (not stuck in GENERATING).
 Dispatch success → session transitions from DISPATCHING to GENERATING.
@@ -24,7 +35,7 @@ from oracle.config import (
     GITHUB_DISPATCH_TOKEN,
 )
 from oracle.voice_registry import validate_voice, get_kokoro_lang_code
-from oracle.text_chunker import chunk_text, MAX_CHUNK_SIZE
+from oracle.text_chunker import chunk_text
 
 logger = logging.getLogger(__name__)
 
@@ -61,18 +72,25 @@ def dispatch_tts_job(session, chunks: list = None) -> dict:
 
     total_chunks = len(chunks)
 
+    # Combine text-related fields into one JSON string to stay within
+    # GitHub's 10-property client_payload limit
+    text_data = json.dumps({
+        "input_text": session.input_text,
+        "chunks": chunks,
+        "total_chunks": total_chunks,
+    })
+
+    # Payload: 9 properties (within the 10-property GitHub limit)
     payload = {
         "session_id": session.session_id,
-        "telegram_user_id": str(session.telegram_user_id),
-        "chat_id": str(session.chat_id),
-        "input_text": session.input_text,  # Full text for reference
-        "chunks": chunks,  # Ordered list of text chunks
-        "total_chunks": total_chunks,
+        "text_data": text_data,
         "language_id": session.language_id,
         "kokoro_lang_code": lang_code,
         "voice_id": session.voice_id,
         "speed": str(session.speed),
         "request_id": request_id,
+        "telegram_user_id": str(session.telegram_user_id),
+        "chat_id": str(session.chat_id),
     }
 
     url = f"{GITHUB_API_BASE}/repos/{GITHUB_REPO_OWNER}/{GITHUB_REPO_NAME}/dispatches"
