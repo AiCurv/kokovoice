@@ -441,11 +441,19 @@ def webhook_endpoint():
         if update is None:
             return jsonify({"status": "invalid_update"}), 400
 
-        # Put the update into the Application's update_queue.
-        # The Application's own event loop will process it via the
-        # registered handlers. This is the CORRECT bridge pattern for
-        # python-telegram-bot v21+ with external webhook servers.
-        telegram_app.update_queue.put_nowait(update)
+        # Process the update directly on the Application's event loop
+        # using run_coroutine_threadsafe. This is the most reliable bridge
+        # pattern for python-telegram-bot v21+ with Flask.
+        if _app_loop is None or _app_loop.is_closed():
+            logger.error("Application loop not available for webhook processing")
+            return jsonify({"status": "error", "message": "loop not available"}), 500
+
+        future = asyncio.run_coroutine_threadsafe(
+            telegram_app.process_update(update),
+            _app_loop,
+        )
+        # Wait for processing to complete (with timeout)
+        future.result(timeout=30)
         return jsonify({"status": "ok"}), 200
 
     except Exception as e:
