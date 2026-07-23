@@ -61,7 +61,7 @@ from oracle.config import (
     WEBHOOK_URL_BASE,
     ORACLE_COMPLETION_SECRET,
     TELEGRAM_WEBHOOK_SECRET,
-    MAX_INPUT_TEXT_LENGTH,
+    HARD_REJECTION_LIMIT,
 )
 from oracle.session_store import SessionStore
 from oracle.telegram_ui import (
@@ -255,8 +255,8 @@ async def text_handler(update: Update, context):
 
     # HARD LIMIT: Maximum input length (for extreme abuse prevention)
     # Normal text >500 chars is chunked automatically, NOT rejected.
-    # Only truly extreme text (>10000 chars) is rejected.
-    if len(input_text) > 10000:
+    # Only truly extreme text (>HARD_REJECTION_LIMIT chars) is rejected.
+    if len(input_text) > HARD_REJECTION_LIMIT:
         await update.message.reply_text(
             f"⚠️ Text is extremely long ({len(input_text)} chars). "
             f"Please send something under 10,000 characters."
