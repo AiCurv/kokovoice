@@ -23,7 +23,11 @@ import json
 import os
 import sys
 import requests
+import urllib3
 from pathlib import Path
+
+# Suppress InsecureRequestWarning for self-signed cert on Oracle VM
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
@@ -78,7 +82,7 @@ def send_completion_callback(session_id, request_id, status, error_message=None,
     }
 
     try:
-        resp = requests.post(completion_url, json=payload, headers=headers, timeout=30)
+        resp = requests.post(completion_url, json=payload, headers=headers, timeout=30, verify=False)
         print(f"Completion callback: status_code={resp.status_code}")
 
         if status == "success" and resp.status_code == 200:
@@ -117,6 +121,7 @@ def upload_audio_binary(upload_url, upload_token, session_id, request_id,
                 files=files,
                 data=data,
                 timeout=120,
+                verify=False,
             )
         print(f"Audio upload (chunk {chunk_num}/{total_chunks}): status_code={resp.status_code}")
         return resp.status_code in (200, 201)
