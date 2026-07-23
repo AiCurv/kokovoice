@@ -1,9 +1,15 @@
 """
-GitHub Actions Dispatch — asynchronously trigger Kokoro TTS workflows.
+GitHub Actions Dispatch — trigger Kokoro TTS workflows via repository_dispatch.
 
 This module sends a repository_dispatch event to GitHub Actions with
-the TTS session details. It is called AFTER the Telegram callback is
-acknowledged, so it never blocks the Telegram response.
+the TTS session details, including text chunks for long input.
+
+It is called AFTER the Telegram callback is acknowledged and AFTER the
+session transitions to DISPATCHING state, so it never blocks the Telegram
+response.
+
+Dispatch failure → session transitions to FAILED (not stuck in GENERATING).
+Dispatch success → session transitions from DISPATCHING to GENERATING.
 """
 
 import json
@@ -18,18 +24,20 @@ from oracle.config import (
     GITHUB_DISPATCH_TOKEN,
 )
 from oracle.voice_registry import validate_voice, get_kokoro_lang_code
+from oracle.text_chunker import chunk_text, MAX_CHUNK_SIZE
 
 logger = logging.getLogger(__name__)
 
 GITHUB_API_BASE = "https://api.github.com"
 
 
-def dispatch_tts_job(session) -> dict:
+def dispatch_tts_job(session, chunks: list = None) -> dict:
     """
     Dispatch a Kokoro TTS job to GitHub Actions via repository_dispatch.
 
     Args:
         session: A Session object with language_id, voice_id, input_text, etc.
+        chunks: List of text chunks (if None, auto-chunk from session.input_text)
 
     Returns:
         dict with 'request_id' and dispatch status info.
@@ -47,11 +55,19 @@ def dispatch_tts_job(session) -> dict:
     lang_code = get_kokoro_lang_code(session.language_id)
     request_id = uuid.uuid4().hex
 
+    # Auto-chunk if chunks not provided
+    if chunks is None:
+        chunks = chunk_text(session.input_text)
+
+    total_chunks = len(chunks)
+
     payload = {
         "session_id": session.session_id,
         "telegram_user_id": str(session.telegram_user_id),
         "chat_id": str(session.chat_id),
-        "input_text": session.input_text,
+        "input_text": session.input_text,  # Full text for reference
+        "chunks": chunks,  # Ordered list of text chunks
+        "total_chunks": total_chunks,
         "language_id": session.language_id,
         "kokoro_lang_code": lang_code,
         "voice_id": session.voice_id,
@@ -70,6 +86,11 @@ def dispatch_tts_job(session) -> dict:
         "client_payload": payload,
     }
 
+    logger.info(
+        "Dispatching TTS job: session=%s voice=%s lang=%s request_id=%s chunks=%d",
+        session.session_id, session.voice_id, session.language_id, request_id, total_chunks,
+    )
+
     response = requests.post(url, headers=headers, json=body, timeout=30)
 
     if response.status_code != 204:
@@ -81,11 +102,8 @@ def dispatch_tts_job(session) -> dict:
         response.raise_for_status()
 
     logger.info(
-        "Dispatched TTS job: session=%s voice=%s lang=%s request_id=%s",
-        session.session_id,
-        session.voice_id,
-        session.language_id,
+        "Dispatched TTS job successfully: request_id=%s",
         request_id,
     )
 
-    return {"request_id": request_id, "status": "dispatched"}
+    return {"request_id": request_id, "status": "dispatched", "total_chunks": total_chunks}

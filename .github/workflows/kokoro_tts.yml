@@ -44,7 +44,7 @@ jobs:
         run: |
           python3 scripts/validate_payload.py
 
-      - name: Run Kokoro TTS inference and deliver audio
+      - name: Run Kokoro TTS inference and deliver audio (chunked)
         env:
           DISPATCH_TEXT: ${{ github.event.client_payload.input_text }}
           DISPATCH_LANG_CODE: ${{ github.event.client_payload.kokoro_lang_code }}
@@ -53,6 +53,8 @@ jobs:
           DISPATCH_SESSION_ID: ${{ github.event.client_payload.session_id }}
           DISPATCH_REQUEST_ID: ${{ github.event.client_payload.request_id }}
           DISPATCH_CHAT_ID: ${{ github.event.client_payload.chat_id }}
+          DISPATCH_CHUNKS_JSON: ${{ github.event.client_payload.chunks }}
+          DISPATCH_TOTAL_CHUNKS: ${{ github.event.client_payload.total_chunks }}
           ORACLE_COMPLETION_URL: ${{ secrets.ORACLE_COMPLETION_URL }}
           ORACLE_COMPLETION_SECRET: ${{ secrets.ORACLE_COMPLETION_SECRET }}
         run: |
@@ -61,4 +63,4 @@ jobs:
       - name: Clean up temporary files
         if: always()
         run: |
-          rm -f /tmp/kokoro_output.wav
+          rm -f /tmp/kokoro_output*.wav

@@ -4,16 +4,10 @@ Kokovoicebot — Oracle Control Plane Server.
 Persistent Telegram webhook server that handles the TTS flow using
 python-telegram-bot v21+ Application-based API with Flask webhook receiver.
 
-ARCHITECTURE (corrected):
+ARCHITECTURE:
   Flask receives the webhook POST → puts the Update into the Application's
   update_queue → the Application's own persistent event loop processes it
-  via its registered async handlers. This is the ONLY safe way to bridge
-  Flask (sync) with python-telegram-bot v21+ (async Application).
-
-  We NEVER create temporary event loops or call asyncio.run() for Bot
-  methods from Flask endpoints. Instead, we use the Application's
-  update_queue.put() to schedule work on the Application's loop, and
-  asyncio.run_coroutine_threadsafe() for async work from sync threads.
+  via its registered async handlers.
 
 Result-transfer architecture (two-step binary upload):
   Step 1: Small JSON callback to /completion (< 65 KB)
@@ -22,10 +16,25 @@ Result-transfer architecture (two-step binary upload):
 CRITICAL RULE: answer_callback_query is called IMMEDIATELY on every callback
 before any slow operation. This prevents the permanent-spinner bug.
 
+State Machine (per feedback requirements):
+  IDLE → TEXT_RECEIVED → LANGUAGE_SELECTION → VOICE_SELECTION → CONFIRMATION
+  → DISPATCHING → GENERATING → UPLOAD_PENDING → DELIVERING → COMPLETED
+  → (or FAILED / DELIVERY_FAILED / CANCELLED at any point)
+
+  DISPATCHING is distinct from GENERATING:
+    DISPATCHING = GitHub API call in progress (dispatch not yet confirmed)
+    GENERATING = GitHub Actions workflow is running (dispatch succeeded)
+  If dispatch fails → state becomes FAILED (not stuck in GENERATING)
+
+Text chunking:
+  Long text (>500 chars) is NOT rejected. It is automatically chunked
+  into ordered segments and processed as a single GitHub Actions request.
+  Each audio chunk is delivered to Telegram in order with numbering.
+
 Security:
   - Only ALLOWED_TELEGRAM_USER_ID may use the bot (single-user lock)
   - Telegram webhook secret_token validated on every /webhook POST
-  - HMAC upload tokens are one-time-use (consumed after first valid upload)
+  - HMAC upload tokens are one-time-use (persisted to session_store)
   - Completion endpoint authenticated via X-Completion-Secret header
   - Duplicate completion callbacks rejected by state machine
 """
@@ -37,6 +46,7 @@ import json
 import logging
 import threading
 import time
+import uuid
 from pathlib import Path
 
 from flask import Flask, request, jsonify
@@ -63,6 +73,7 @@ from oracle.telegram_ui import (
 )
 from oracle.voice_registry import get_language, get_kokoro_lang_code, validate_voice, get_voice_display_name
 from oracle.github_dispatch import dispatch_tts_job
+from oracle.text_chunker import chunk_text
 
 # Configure logging
 logging.basicConfig(
@@ -76,12 +87,10 @@ app = Flask(__name__)
 app.config["MAX_CONTENT_LENGTH"] = 50 * 1024 * 1024  # 50 MB for audio uploads
 
 # ── Create the telegram-bot Application (v21+ API) ──
-# This Application has its OWN persistent event loop that runs in a
-# background thread. All async Bot methods run on this loop.
 telegram_app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 store = SessionStore()
 
-# Track consumed upload tokens for one-time-use enforcement
+# Track consumed upload tokens for one-time-use enforcement (in-memory + persisted)
 _consumed_tokens = set()  # type: set
 
 # The Application's event loop reference — set during startup
@@ -105,13 +114,22 @@ def _validate_upload_token(session_id: str, request_id: str, token: str) -> bool
     """
     Validate upload token: HMAC must match AND token must not have been
     consumed already (one-time-use enforcement).
+
+    One-time-use is enforced via:
+    1. In-memory _consumed_tokens set (fast check)
+    2. Session state — session in UPLOAD_PENDING or later means token was used
     """
     expected = _generate_upload_token(session_id, request_id)
     if not hmac.compare_digest(expected, token):
         return False
-    # One-time-use: reject if already consumed
+    # One-time-use: reject if already consumed in this process
     if token in _consumed_tokens:
         logger.warning("Rejected replayed upload token for session %s", session_id)
+        return False
+    # One-time-use: reject if session has already moved past UPLOAD_PENDING
+    session = store.get(session_id)
+    if session is not None and session.state in ("DELIVERING", "COMPLETED", "DELIVERY_FAILED", "FAILED"):
+        logger.warning("Rejected upload token for session %s in state %s", session_id, session.state)
         return False
     return True
 
@@ -138,7 +156,7 @@ async def _send_unauthorized_reply(chat_id: int):
 
 
 async def _mark_session_failed(session, error_msg: str):
-    """Mark session as failed and update Telegram UI."""
+    """Mark session as FAILED and update Telegram UI."""
     session.state = "FAILED"
     store.update(session)
     try:
@@ -154,29 +172,42 @@ async def _mark_session_failed(session, error_msg: str):
         logger.warning("Failed to update UI for failed session: %s", e)
 
 
-async def _deliver_audio_to_telegram(session, audio_path: Path):
+async def _deliver_audio_to_telegram(session, audio_path: Path, chunk_num: int = 1, total_chunks: int = 1):
     """Deliver the generated audio file to the user via Telegram."""
     bot = telegram_app.bot
     lang_display = get_language(session.language_id)["display_name"]
     voice_display = get_voice_display_name(session.language_id, session.voice_id)
 
+    # Build caption with chunk numbering if multiple chunks
+    if total_chunks > 1:
+        caption = f"Part {chunk_num} of {total_chunks}\nLanguage: {lang_display} | Voice: {voice_display}"
+        title = f"Kokoro TTS — Part {chunk_num}"
+    else:
+        caption = f"Language: {lang_display} | Voice: {voice_display}"
+        title = "Kokoro TTS"
+
     with open(audio_path, "rb") as f:
         await bot.send_audio(
             chat_id=session.chat_id,
             audio=f,
-            title="Kokoro TTS",
+            title=title,
             performer="Kokoro",
-            caption=f"Language: {lang_display} | Voice: {voice_display}",
+            caption=caption,
         )
 
     session.state = "COMPLETED"
     store.update(session)
 
     try:
+        completion_text = f"✅ Audio delivered!\n\nLanguage: {lang_display}\nVoice: {voice_display}"
+        if total_chunks > 1:
+            completion_text += f"\n\n({total_chunks} parts delivered)"
+        completion_text += "\n\nSend me more text anytime."
+
         await bot.edit_message_text(
             chat_id=session.chat_id,
             message_id=session.ui_message_id,
-            text=f"✅ Audio delivered!\n\nLanguage: {lang_display}\nVoice: {voice_display}\n\nSend me more text anytime.",
+            text=completion_text,
         )
     except Exception:
         pass
@@ -187,7 +218,6 @@ async def _deliver_audio_to_telegram(session, audio_path: Path):
 def _schedule_async(coro):
     """
     Schedule an async coroutine to run on the Application's event loop.
-    
     Uses asyncio.run_coroutine_threadsafe() which is the correct way to
     submit work to a running event loop from a different (sync) thread.
     """
@@ -223,24 +253,32 @@ async def text_handler(update: Update, context):
         await update.message.reply_text("Please send some text to convert to speech.")
         return
 
-    if len(input_text) > MAX_INPUT_TEXT_LENGTH:
+    # HARD LIMIT: Maximum input length (for extreme abuse prevention)
+    # Normal text >500 chars is chunked automatically, NOT rejected.
+    # Only truly extreme text (>10000 chars) is rejected.
+    if len(input_text) > 10000:
         await update.message.reply_text(
-            f"⚠️ Text too long ({len(input_text)} chars). Maximum is {MAX_INPUT_TEXT_LENGTH} characters. "
-            f"Please send a shorter message."
+            f"⚠️ Text is extremely long ({len(input_text)} chars). "
+            f"Please send something under 10,000 characters."
         )
         return
 
     chat_id = update.effective_chat.id
     message_id = update.message.message_id
 
+    # Chunk the text if it exceeds the single-chunk threshold
+    chunks = chunk_text(input_text.strip())
+    logger.info("Text input: %d chars → %d chunks", len(input_text), len(chunks))
+
     # Delete any previous active session for this user
     old_session = store.get_by_user(user_id)
     if old_session:
         store.delete(old_session.session_id)
 
-    # Create new session
+    # Create new session with full text and chunk info
     session = store.create(user_id, chat_id, message_id, input_text.strip())
     session.state = "LANGUAGE_SELECTION"
+    session.total_chunks = len(chunks)
     store.update(session)
 
     # Send language selection UI
@@ -258,7 +296,7 @@ async def text_handler(update: Update, context):
 async def callback_handler(update: Update, context):
     """
     Handle all inline keyboard callbacks.
-    
+
     CRITICAL: answer_callback_query is called IMMEDIATELY before any slow work.
     """
     query = update.callback_query
@@ -371,7 +409,14 @@ async def callback_handler(update: Update, context):
             )
 
     elif action == "generate":
-        session.state = "GENERATING"
+        # ── Guard: prevent duplicate Generate taps ──
+        if session.state in ("DISPATCHING", "GENERATING", "UPLOAD_PENDING", "DELIVERING"):
+            # Already processing — ignore duplicate tap
+            logger.info("Duplicate Generate tap for session %s in state %s — ignoring", session_id, session.state)
+            return
+
+        # Transition to DISPATCHING first — dispatch call hasn't succeeded yet
+        session.state = "DISPATCHING"
         store.update(session)
 
         lang_display = get_language(session.language_id)["display_name"]
@@ -379,23 +424,36 @@ async def callback_handler(update: Update, context):
 
         keyboard = generating_keyboard(session_id)
         await query.edit_message_text(
-            text=f"⏳ Generating your audio...\n\nLanguage: {lang_display}\nVoice: {voice_display}",
+            text=f"⏳ Dispatching your audio request...\n\nLanguage: {lang_display}\nVoice: {voice_display}",
             reply_markup=keyboard,
         )
 
         # Dispatch GitHub Actions in a background thread.
-        # The thread is sync; when it needs to call async Bot methods
-        # (e.g., _mark_session_failed), it uses _schedule_async() to
-        # submit the coroutine to the Application's running event loop.
         def _dispatch_and_handle():
             try:
-                result = dispatch_tts_job(session)
+                # Chunk the text for the dispatch payload
+                chunks = chunk_text(session.input_text)
+
+                result = dispatch_tts_job(session, chunks)
                 session.request_id = result["request_id"]
+
+                # Dispatch succeeded — transition from DISPATCHING to GENERATING
+                session.state = "GENERATING"
                 store.update(session)
-                logger.info("GitHub dispatch succeeded: request_id=%s", result["request_id"])
+
+                # Update UI to show "Generating" (dispatch confirmed)
+                _schedule_async(_update_generating_ui(session))
+
+                logger.info(
+                    "GitHub dispatch succeeded: request_id=%s, %d chunks",
+                    result["request_id"], len(chunks),
+                )
             except Exception as e:
                 logger.error("GitHub dispatch failed: %s", e)
-                _schedule_async(_mark_session_failed(session, "Could not dispatch to GitHub Actions."))
+                # Dispatch failed — transition to FAILED (not stuck in DISPATCHING/GENERATING)
+                session.state = "FAILED"
+                store.update(session)
+                _schedule_async(_mark_session_failed(session, "Could not dispatch to GitHub Actions. Please try again."))
 
         thread = threading.Thread(target=_dispatch_and_handle, daemon=True)
         thread.start()
@@ -411,12 +469,35 @@ async def callback_handler(update: Update, context):
         session.language_id = ""
         session.voice_id = ""
         session.voice_page = 0
+        session.request_id = ""
+        session.state = "LANGUAGE_SELECTION"
         store.update(session)
         keyboard = language_keyboard(session_id)
         await query.edit_message_text(
             text=f"Choose the language/accent for your voice:\n\nOriginal text: \"{session.input_text[:100]}\"",
             reply_markup=keyboard,
         )
+
+
+async def _update_generating_ui(session):
+    """Update Telegram UI after dispatch succeeds (DISPATCHING → GENERATING)."""
+    try:
+        lang_display = get_language(session.language_id)["display_name"]
+        voice_display = get_voice_display_name(session.language_id, session.voice_id)
+        keyboard = generating_keyboard(session.session_id)
+
+        chunks_info = ""
+        if session.total_chunks > 1:
+            chunks_info = f"\n({session.total_chunks} text chunks)"
+
+        await telegram_app.bot.edit_message_text(
+            chat_id=session.chat_id,
+            message_id=session.ui_message_id,
+            text=f"⏳ Generating your audio...{chunks_info}\n\nLanguage: {lang_display}\nVoice: {voice_display}",
+            reply_markup=keyboard,
+        )
+    except Exception as e:
+        logger.warning("Failed to update generating UI: %s", e)
 
 
 # ── Register handlers ──
@@ -442,8 +523,6 @@ def webhook_endpoint():
             return jsonify({"status": "invalid_update"}), 400
 
         # Process the update directly on the Application's event loop
-        # using run_coroutine_threadsafe. This is the most reliable bridge
-        # pattern for python-telegram-bot v21+ with Flask.
         if _app_loop is None or _app_loop.is_closed():
             logger.error("Application loop not available for webhook processing")
             return jsonify({"status": "error", "message": "loop not available"}), 500
@@ -473,6 +552,8 @@ def completion_endpoint():
     session_id = data.get("session_id")
     request_id = data.get("request_id")
     status = data.get("status")
+    chunk_num = data.get("chunk_num", 1)  # Which chunk this completion refers to
+    total_chunks = data.get("total_chunks", 1)  # Total number of chunks
 
     if not session_id:
         return jsonify({"error": "missing session_id"}), 400
@@ -483,7 +564,8 @@ def completion_endpoint():
 
     # Reject if session has already moved past GENERATING state
     # (prevents duplicate completion callbacks)
-    if session.state in ("COMPLETED", "DELIVERING", "UPLOAD_PENDING"):
+    # Include FAILED and DELIVERY_FAILED to prevent duplicates on failure path
+    if session.state in ("COMPLETED", "DELIVERING", "UPLOAD_PENDING", "FAILED", "DELIVERY_FAILED"):
         logger.info("Duplicate completion for session %s in state %s — ignoring", session_id, session.state)
         return jsonify({"status": "already_completed"}), 200
 
@@ -493,16 +575,30 @@ def completion_endpoint():
         return jsonify({"error": "unexpected_session_state"}), 400
 
     if status == "success":
+        # Verify request_id matches what we stored during dispatch
+        if session.request_id and request_id != session.request_id:
+            logger.warning(
+                "Completion request_id mismatch: expected=%s got=%s",
+                session.request_id, request_id,
+            )
+            return jsonify({"error": "request_id mismatch"}), 400
+
         upload_token = _generate_upload_token(session_id, request_id)
         session.request_id = request_id
         # Transition to UPLOAD_PENDING — prevents duplicate completions
         session.state = "UPLOAD_PENDING"
+        session.total_chunks = total_chunks
         store.update(session)
-        logger.info("Completion callback: success, upload_token for session %s", session_id)
+        logger.info(
+            "Completion callback: success, upload_token for session %s (chunk %d of %d)",
+            session_id, chunk_num, total_chunks,
+        )
         return jsonify({
             "status": "upload_ready",
             "upload_url": f"{WEBHOOK_URL_BASE}/upload/audio",
             "upload_token": upload_token,
+            "chunk_num": chunk_num,
+            "total_chunks": total_chunks,
         }), 200
 
     elif status == "failure":
@@ -519,9 +615,14 @@ def upload_audio_endpoint():
     session_id = request.form.get("session_id")
     request_id = request.form.get("request_id")
     upload_token = request.form.get("upload_token")
+    chunk_num_str = request.form.get("chunk_num", "1")
+    total_chunks_str = request.form.get("total_chunks", "1")
 
     if not session_id or not request_id or not upload_token:
         return jsonify({"error": "missing session_id, request_id, or upload_token"}), 400
+
+    chunk_num = int(chunk_num_str)
+    total_chunks = int(total_chunks_str)
 
     if not _validate_upload_token(session_id, request_id, upload_token):
         logger.warning("Upload endpoint: invalid or replayed upload_token")
@@ -534,7 +635,7 @@ def upload_audio_endpoint():
     if session is None:
         return jsonify({"error": "session not found or expired"}), 404
 
-    if session.state not in ("UPLOAD_PENDING", "GENERATING"):
+    if session.state not in ("UPLOAD_PENDING",):
         logger.info("Upload for session %s in state %s — already handled", session_id, session.state)
         return jsonify({"status": "already_completed"}), 200
 
@@ -542,7 +643,7 @@ def upload_audio_endpoint():
     if audio_file is None:
         return jsonify({"error": "missing audio_file"}), 400
 
-    audio_path = Path(f"/tmp/kokoro_{session_id}.wav")
+    audio_path = Path(f"/tmp/kokoro_{session_id}_chunk{chunk_num}.wav")
     audio_file.save(audio_path)
 
     if audio_path.stat().st_size == 0:
@@ -556,16 +657,18 @@ def upload_audio_endpoint():
     try:
         # Schedule audio delivery on the Application's event loop and wait for result
         future = asyncio.run_coroutine_threadsafe(
-            _deliver_audio_to_telegram(session, audio_path),
+            _deliver_audio_to_telegram(session, audio_path, chunk_num, total_chunks),
             _app_loop,
         )
         # Wait for delivery to complete (with timeout)
         future.result(timeout=60)
-        logger.info("Audio delivered to Telegram for session %s", session_id)
+        logger.info("Audio chunk %d/%d delivered to Telegram for session %s", chunk_num, total_chunks, session_id)
         return jsonify({"status": "delivered"}), 200
 
     except Exception as e:
         logger.error("Failed to deliver audio: %s", e)
+        session.state = "DELIVERY_FAILED"
+        store.update(session)
         _schedule_async(_mark_session_failed(session, "Generation succeeded but delivery failed."))
         return jsonify({"error": "delivery failed"}), 500
 
@@ -585,9 +688,6 @@ def main():
     logger.info("Allowed Telegram user ID: %s", ALLOWED_TELEGRAM_USER_ID)
 
     # ── Start Application's event loop in a background thread ──
-    # The Application needs a persistent running event loop for all async work.
-    # We initialize and start it in a dedicated thread, then capture the loop
-    # reference for use by _schedule_async() and run_coroutine_threadsafe().
     def _run_app():
         global _app_loop
         loop = asyncio.new_event_loop()

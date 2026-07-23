@@ -2,8 +2,16 @@
 Lightweight session store for TTS sessions.
 
 Sessions track the stateful flow: text received → language → voice →
-confirmation → generating → upload_pending → delivery → completed.
-State is persisted to a JSON file on disk so it survives process restarts.
+confirmation → dispatching → generating → upload_pending → delivery → completed.
+
+State Machine (per feedback requirements):
+  IDLE → TEXT_RECEIVED → LANGUAGE_SELECTION → VOICE_SELECTION → CONFIRMATION
+  → DISPATCHING → GENERATING → UPLOAD_PENDING → DELIVERING → COMPLETED
+  → (or FAILED / DELIVERY_FAILED / CANCELLED at any point)
+
+  DISPATCHING is distinct from GENERATING:
+    DISPATCHING = GitHub API call in progress
+    GENERATING = GitHub Actions workflow is running (dispatch confirmed)
 
 Security: Only ALLOWED_TELEGRAM_USER_ID may create or interact with sessions.
 Session ownership is validated on every callback.
@@ -24,6 +32,23 @@ from oracle.config import ALLOWED_TELEGRAM_USER_ID, SESSION_EXPIRY_SECONDS
 
 _STORE_PATH = Path(__file__).parent / "sessions.json"
 
+# Valid session states (per feedback requirements)
+VALID_STATES = (
+    "IDLE",
+    "TEXT_RECEIVED",
+    "LANGUAGE_SELECTION",
+    "VOICE_SELECTION",
+    "CONFIRMATION",
+    "DISPATCHING",
+    "GENERATING",
+    "UPLOAD_PENDING",
+    "DELIVERING",
+    "COMPLETED",
+    "FAILED",
+    "DELIVERY_FAILED",
+    "CANCELLED",
+)
+
 
 class Session:
     """Represents a single TTS session."""
@@ -43,6 +68,7 @@ class Session:
         self.voice_page: int = data.get("voice_page", 0)
         self.github_run_id: str = data.get("github_run_id", "")
         self.request_id: str = data.get("request_id", "")
+        self.total_chunks: int = data.get("total_chunks", 1)
         self.created_at: float = data.get("created_at", 0.0)
         self.updated_at: float = data.get("updated_at", 0.0)
 
@@ -62,6 +88,7 @@ class Session:
             "voice_page": self.voice_page,
             "github_run_id": self.github_run_id,
             "request_id": self.request_id,
+            "total_chunks": self.total_chunks,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -87,7 +114,6 @@ class SessionStore:
                 with open(_STORE_PATH) as f:
                     content = f.read().strip()
                     if not content:
-                        # Empty file — initialize with empty dict
                         data = {}
                     else:
                         data = json.loads(content)
@@ -131,6 +157,7 @@ class SessionStore:
             "voice_page": 0,
             "github_run_id": "",
             "request_id": "",
+            "total_chunks": 1,
             "created_at": now,
             "updated_at": now,
         })

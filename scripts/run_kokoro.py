@@ -1,20 +1,16 @@
 """
 Run Kokoro TTS inference and deliver the result to Oracle.
 
-Two-step delivery architecture:
-  Step 1: POST a small JSON callback to Oracle /completion endpoint
-          containing session_id, request_id, status, and error_message.
-          On success, Oracle returns an upload_token (HMAC-authenticated)
-          and an upload_url.
+Supports text chunking: if DISPATCH_CHUNKS_JSON is provided, each chunk
+is processed sequentially in a single workflow run. All audio outputs are
+delivered to Oracle in order.
 
-  Step 2: POST the actual WAV audio as binary multipart/form-data to
-          Oracle /upload/audio endpoint, authenticated by the upload_token
-          from Step 1.
+Two-step delivery architecture per chunk:
+  Step 1: POST a small JSON callback to Oracle /completion endpoint
+  Step 2: POST the WAV audio as binary multipart/form-data to Oracle /upload/audio
 
 Why two steps? GitHub Actions repository_dispatch client_payload has a
-~65 KB hard limit. Even the shortest TTS audio (3 seconds, 208 KB base64)
-exceeds this limit by 3x. Splitting metadata and binary data avoids this
-constraint entirely.
+~65 KB hard limit. Even the shortest TTS audio exceeds this by 3x.
 
 Security:
   - Text is passed via environment variables, never interpolated into shell commands
@@ -33,6 +29,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from kokoro import KPipeline
 import soundfile as sf
+import numpy as np
 
 
 def validate_wav(path: str) -> bool:
@@ -47,7 +44,8 @@ def validate_wav(path: str) -> bool:
     return True
 
 
-def send_completion_callback(session_id, request_id, status, error_message=None):
+def send_completion_callback(session_id, request_id, status, error_message=None,
+                             chunk_num=1, total_chunks=1):
     """
     Step 1: Send a small JSON callback to Oracle /completion endpoint.
 
@@ -68,6 +66,8 @@ def send_completion_callback(session_id, request_id, status, error_message=None)
         "session_id": session_id,
         "request_id": request_id,
         "status": status,
+        "chunk_num": chunk_num,
+        "total_chunks": total_chunks,
     }
     if error_message:
         payload["error_message"] = error_message[:500]
@@ -94,7 +94,8 @@ def send_completion_callback(session_id, request_id, status, error_message=None)
         return None
 
 
-def upload_audio_binary(upload_url, upload_token, session_id, request_id, audio_path):
+def upload_audio_binary(upload_url, upload_token, session_id, request_id,
+                        audio_path, chunk_num=1, total_chunks=1):
     """
     Step 2: Upload the WAV audio file as binary multipart/form-data.
 
@@ -108,33 +109,32 @@ def upload_audio_binary(upload_url, upload_token, session_id, request_id, audio_
                 "session_id": session_id,
                 "request_id": request_id,
                 "upload_token": upload_token,
+                "chunk_num": str(chunk_num),
+                "total_chunks": str(total_chunks),
             }
             resp = requests.post(
                 upload_url,
                 files=files,
                 data=data,
-                timeout=120,  # Allow up to 2 minutes for large file upload
+                timeout=120,
             )
-        print(f"Audio upload: status_code={resp.status_code}")
+        print(f"Audio upload (chunk {chunk_num}/{total_chunks}): status_code={resp.status_code}")
         return resp.status_code in (200, 201)
     except Exception as e:
         print(f"Audio upload failed: {e}")
         return False
 
 
-def main():
-    text = os.environ["DISPATCH_TEXT"]
-    lang_code = os.environ["DISPATCH_LANG_CODE"]
-    voice_id = os.environ["DISPATCH_VOICE"]
-    speed = float(os.environ.get("DISPATCH_SPEED", "1.0"))
-    session_id = os.environ["DISPATCH_SESSION_ID"]
-    request_id = os.environ["DISPATCH_REQUEST_ID"]
-    output_path = "/tmp/kokoro_output.wav"
+def run_single_chunk(pipeline, text, voice_id, speed, session_id, request_id,
+                     chunk_num, total_chunks, completion_url, completion_secret):
+    """
+    Run Kokoro inference on a single text chunk and deliver the audio.
+
+    Returns True on success, False on failure.
+    """
+    output_path = f"/tmp/kokoro_output_chunk{chunk_num}.wav"
 
     try:
-        # Initialize Kokoro pipeline
-        pipeline = KPipeline(lang_code=lang_code)
-
         # Run inference
         generator = pipeline(text, voice=voice_id, speed=speed)
 
@@ -145,10 +145,9 @@ def main():
                 audio_segments.append(audio)
 
         if not audio_segments:
-            raise ValueError("KPipeline produced no audio segments")
+            raise ValueError(f"KPipeline produced no audio segments for chunk {chunk_num}")
 
         # Concatenate segments
-        import numpy as np
         full_audio = np.concatenate(audio_segments)
 
         # Write WAV file
@@ -156,39 +155,121 @@ def main():
 
         # Validate output
         if not validate_wav(output_path):
-            raise ValueError("Output WAV validation failed")
+            raise ValueError(f"Output WAV validation failed for chunk {chunk_num}")
 
-        print(f"Kokoro inference succeeded: {len(full_audio)} samples, 24 kHz")
-        print(f"Output file: {output_path} ({Path(output_path).stat().st_size} bytes)")
+        print(f"Chunk {chunk_num}/{total_chunks}: {len(full_audio)} samples, 24 kHz")
 
-        # ── Step 1: Send completion callback (small JSON) ──
-        upload_info = send_completion_callback(session_id, request_id, "success")
+        # ── Step 1: Send completion callback ──
+        upload_info = send_completion_callback(
+            session_id, request_id, "success",
+            chunk_num=chunk_num, total_chunks=total_chunks,
+        )
 
         if upload_info and upload_info.get("upload_url"):
             # ── Step 2: Upload audio binary ──
             success = upload_audio_binary(
                 upload_info["upload_url"],
                 upload_info["upload_token"],
-                session_id,
-                request_id,
+                session_id, request_id,
                 output_path,
+                chunk_num=chunk_num, total_chunks=total_chunks,
             )
             if not success:
-                print("Audio upload failed — reporting failure")
+                print(f"Audio upload failed for chunk {chunk_num} — reporting failure")
                 send_completion_callback(
                     session_id, request_id, "failure",
-                    "Audio upload to Oracle failed"
+                    f"Audio upload to Oracle failed for chunk {chunk_num}",
+                    chunk_num=chunk_num, total_chunks=total_chunks,
                 )
+                return False
         else:
             print("WARNING: No upload_url received from Oracle; audio not delivered")
+            return False
+
+        # Clean up chunk file
+        Path(output_path).unlink(missing_ok=True)
+
+        return True
+
+    except Exception as e:
+        error_msg = str(e)
+        print(f"Chunk {chunk_num} FAILED: {error_msg}")
+
+        # Clean up on failure too
+        Path(output_path).unlink(missing_ok=True)
+
+        # Report this specific chunk failure
+        send_completion_callback(
+            session_id, request_id, "failure",
+            f"Chunk {chunk_num} generation failed: {error_msg}",
+            chunk_num=chunk_num, total_chunks=total_chunks,
+        )
+        return False
+
+
+def main():
+    text = os.environ.get("DISPATCH_TEXT", "")
+    lang_code = os.environ["DISPATCH_LANG_CODE"]
+    voice_id = os.environ["DISPATCH_VOICE"]
+    speed = float(os.environ.get("DISPATCH_SPEED", "1.0"))
+    session_id = os.environ["DISPATCH_SESSION_ID"]
+    request_id = os.environ["DISPATCH_REQUEST_ID"]
+    chunks_json = os.environ.get("DISPATCH_CHUNKS_JSON", "")
+    total_chunks_str = os.environ.get("DISPATCH_TOTAL_CHUNKS", "1")
+
+    # Parse chunks from JSON string (GitHub Actions passes it as a stringified JSON array)
+    if chunks_json:
+        try:
+            chunks = json.loads(chunks_json)
+        except json.JSONDecodeError:
+            print("WARNING: Failed to parse DISPATCH_CHUNKS_JSON; using full text as single chunk")
+            chunks = [text]
+    else:
+        # No chunks provided — use full text as single chunk
+        chunks = [text]
+
+    total_chunks = int(total_chunks_str)
+
+    # Validate that chunk count matches
+    if len(chunks) != total_chunks:
+        print(f"WARNING: chunks count ({len(chunks)}) != total_chunks ({total_chunks}); using actual count")
+        total_chunks = len(chunks)
+
+    if total_chunks == 0:
+        print("ERROR: No text chunks to process")
+        send_completion_callback(session_id, request_id, "failure", "No text chunks provided")
+        sys.exit(1)
+
+    print(f"Processing {total_chunks} chunks for session {session_id}")
+
+    try:
+        # Initialize Kokoro pipeline (one pipeline for all chunks)
+        pipeline = KPipeline(lang_code=lang_code)
+
+        # Process each chunk sequentially in order
+        failed_chunks = []
+        for i, chunk_text in enumerate(chunks, 1):
+            print(f"--- Chunk {i}/{total_chunks}: {len(chunk_text)} chars ---")
+            success = run_single_chunk(
+                pipeline, chunk_text, voice_id, speed,
+                session_id, request_id, i, total_chunks,
+                os.environ.get("ORACLE_COMPLETION_URL", ""),
+                os.environ.get("ORACLE_COMPLETION_SECRET", ""),
+            )
+            if not success:
+                failed_chunks.append(i)
+
+        if failed_chunks:
+            print(f"FAILED chunks: {failed_chunks}")
+            # If any chunks failed, the session is already marked FAILED via completion callback
+            sys.exit(1)
+
+        print(f"All {total_chunks} chunks delivered successfully!")
 
     except Exception as e:
         error_msg = str(e)
         print(f"Kokoro inference FAILED: {error_msg}")
-
-        # Report failure to Oracle
         send_completion_callback(session_id, request_id, "failure", error_msg)
-
         sys.exit(1)
 
 
